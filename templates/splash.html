@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h1>Welcome</h1>
+    {{if .Error}}
+        <p class="error">{{.Error}}</p>
+    {{end}}
+    {{if .Success}}
+        <p class="success">Check your email for a login link!</p>
+    {{else}}
+        <form method="POST">
+	    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+            <p>
+                <label>Name:</label><br>
+                <input type="text" name="name" value="{{.Name}}" required>
+            </p>
+            <p>
+                <label>Email:</label><br>
+                <input type="email" name="email" value="{{.Email}}" required>
+            </p>
+            <p>
+                <label><input type="checkbox" name="optin" {{if .OptOut}}checked{{end}}> Opt-in to marketing emails</label>
+            </p>
+            <button type="submit">Send My Entry Link</button>
+        </form>
+    {{end}}
+</body>
+</html>
