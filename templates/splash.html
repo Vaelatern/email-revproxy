@@ -1,36 +1,84 @@
 <!DOCTYPE html>
 <html>
-<head>
-    <title>Login</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
-        .error { color: red; }
-        .success { color: green; }
-    </style>
-</head>
-<body>
-    <h1>Welcome</h1>
-    {{if .Error}}
-        <p class="error">{{.Error}}</p>
-    {{end}}
-    {{if .Success}}
-        <p class="success">Check your email for a login link!</p>
-    {{else}}
-        <form method="POST">
-	    <input type="hidden" name="_csrf" value="{{.CSRF}}">
-            <p>
-                <label>Name:</label><br>
-                <input type="text" name="name" value="{{.Name}}" required>
-            </p>
-            <p>
-                <label>Email:</label><br>
-                <input type="email" name="email" value="{{.Email}}" required>
-            </p>
-            <p>
-                <label><input type="checkbox" name="optin" {{if .OptOut}}checked{{end}}> Opt-in to marketing emails</label>
-            </p>
-            <button type="submit">Send My Entry Link</button>
-        </form>
-    {{end}}
-</body>
+	<head>
+		<title>
+			Login
+		</title>
+		<style>
+.error { color: red; }
+.success { color: green; }
+.hasbg {
+	background-image: url("{{ template "bgimg" }}");
+}
+		</style>
+		<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+	</head>
+	<body class="min-h-screen flex items-center relative overflow-hidden">
+		<div class="hasbg absolute inset-0 bg-cover bg-center bg-no-repeat">
+			<div class="absolute inset-0 bg-black/40">
+			</div>
+		</div>
+		<div class="relative z-10 w-full max-w-md ml-8 lg:ml-16">
+			<div class="rounded-lg text-card-foreground backdrop-blur-md bg-white/90 shadow-2xl border-0" data-v0-t="card">
+				{{if not .TriedEmail}}
+				<div class="flex flex-col p-6 space-y-1 text-center">
+					<h3 class="text-3xl font-bold tracking-tight">
+						Welcome
+					</h3>
+					<p class="text-muted-foreground text-base">
+					Enter your email to receive your login link
+					</p>
+				</div>
+				<form method="POST">
+					<input type="hidden" name="_csrf" value="{{.CsrfToken}}">
+					<div class="p-6 pt-0 space-y-4">
+						<div class="space-y-2">
+							<label class="peer-disabled:cursor-not-allowed peer-disabled:opacity-70 text-sm font-medium" for="email">
+								Email Address
+							</label>
+							<input class="flex w-full rounded-md border px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium file:text-foreground placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 h-11 bg-white/80 border-gray-200 focus:border-blue-500 focus:ring-blue-500" name="email" id="email" placeholder="Enter your email" required="" type="email">
+						</div>
+						<div class="space-y-2">
+							<label class="peer-disabled:cursor-not-allowed peer-disabled:opacity-70 text-sm font-medium" for="name">
+								Your Name
+							</label>
+							<div class="relative">
+								<input class="flex w-full rounded-md border px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium file:text-foreground placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 h-11 bg-white/80 border-gray-200 focus:border-blue-500 focus:ring-blue-500 pr-10" name="name" id="name" placeholder="Enter your name" required="" type="text">
+							</div>
+						</div>
+						<div class="flex items-center justify-between">
+							<div class="flex items-center space-x-2">
+								<input name="opt-in" id="opt-in" class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" type="checkbox">
+								<label class="font-medium peer-disabled:cursor-not-allowed peer-disabled:opacity-70 text-sm text-gray-600" for="opt-in">
+									Allow Rare News Emails
+								</label>
+							</div>
+						</div>
+					</div>
+					<div class="items-center p-6 pt-0 flex flex-col space-y-4">
+						<button class="ring-offset-background focus-visible:outline-hidden focus-visible:ring-ring inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm focus-visible:ring-2 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 [&amp;_svg]:pointer-events-none [&amp;_svg]:size-4 [&amp;_svg]:shrink-0 px-4 py-2 w-full h-11 bg-blue-600 hover:bg-blue-700 text-white font-medium transition-colors">
+							Receive Entry Link
+						</button>
+						<div class="relative">
+							<div class="absolute inset-0 flex items-center">
+								<div data-orientation="horizontal" role="none" class="shrink-0 bg-border h-px w-full">
+								</div>
+							</div>
+						</div>
+
+					</div>
+				</form>
+				{{ else }}
+				<div class="flex flex-col p-6 space-y-1 text-center">
+					<h3 class="text-3xl font-bold tracking-tight">
+						Email Sent
+					</h3>
+					<p class="text-muted-foreground text-base">
+					Check your email to login
+					</p>
+				</div>
+				{{ end }}
+			</div>
+		</div>
+	</body>
 </html>

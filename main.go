@@ -1,223 +1,367 @@
 package main
 
 import (
+	"bytes"
 	"embed"
-	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"net/http/httputil"
+	"net/smtp"
 	"net/url"
-	"os"
-	"random"
 	"strings"
 	"time"
 
+	"github.com/Vaelatern/email-revproxy/internal/aerouter"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/ilyakaznacheev/cleanenv"
 	"github.com/joho/godotenv"
-	"github.com/mailgun/mailgun-go/v4"
 )
+
+func dbg(a string) {
+	log.Println(a)
+}
 
 //go:embed templates/*
 var templates embed.FS
 
-type Claims struct {
-	Email string `json:"email"`
-	jwt.StandardClaims
+type WebTemplateArgs struct {
+	Name       string
+	Email      string
+	OptOut     bool
+	Error      string
+	Success    bool
+	CsrfToken  string
+	TriedEmail bool
 }
 
-type RegistrationData struct {
-	Name    string
-	Email   string
-	OptOut  bool
-	Error   string
-	Success bool
+type EmailPayload struct {
+	Name           string
+	Email          string
+	Token          string
+	HttpPathAtSend string
+}
+
+// https://pkg.go.dev/net/smtp#SendMail
+type EmailConf struct {
+	Addr           string `env:"ENDPOINT" yaml:"endpoint" json:"endpoint" env-required:"true"`
+	User           string `env:"USER" env-required:"true"`
+	Pass           string `env:"PASS" env-required:"true"`
+	From           string `env:"FROM" env-required:"true"`
+	Bcc            []string
+	MessageTplName string `env:"MESSAGE_TEMPLATE_NAME" yaml:"message-template-name" json:"message-template-name"`
+	MessageTpl     string `env:"MESSAGE_TEMPLATE" yaml:"message-template" json:"message-template"`
+}
+
+type ClientDetect struct {
+	UseRemoteAddr bool `env:"USE_REMOTE_ADDR" yaml:"use-remote-addr" json:"use-remote-addr"`
 }
 
 type Config struct {
-	AuthKey       string
-	MailgunAPIKey string
-	MailgunDomain string
-	ServerURL     string
-	ProxyAddr     string
-	BindAddr      string
-	CsrfToken     string
+	AuthKey   string       `env:"AUTH_KEY" yaml:"auth-key" json:"auth-key" env-required:"true"`
+	ProxyAddr string       `env:"PROXY_ADDR" yaml:"proxy-address" json:"proxy-address" env-required:"true"`
+	BindAddr  string       `env:"BIND_ADDR" yaml:"bind-address" json:"bind-address" env-default:":8080"`
+	Smtp      EmailConf    `env-prefix:"SMTP" yaml:"smtp" json:"smtp"`
+	Detect    ClientDetect `env-prefix:"CLIENT_DETECT" yaml:"client-detect" json:"client-detect"`
 }
 
-func generateCSRFToken() (string, error) {
-	b := make([]byte, 32)
-	_, err := random.Read(b)
+func (c Config) requestCSRFIp(r *http.Request) string {
+	if c.Detect.UseRemoteAddr {
+		return strings.Split(r.RemoteAddr, ":")[0]
+	}
+	// Get IP from X-Forwarded-For header
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		log.Fatal("Misconfiguration - proxy did not pass X-Forwarded-For so perhaps an attacker can abuse this")
+	}
+	return ip
+}
+
+func (c Config) generateJWT(claims jwt.MapClaims, expireIn time.Duration) (string, error) {
+	// Create JWT claims
+	claims["exp"] = time.Now().Add(expireIn).Unix()
+
+	// Create token with claims
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	// Sign token with a secret key
+	signedToken, err := token.SignedString([]byte(c.AuthKey))
 	if err != nil {
 		return "", err
 	}
-	return base64.StdEncoding.EncodeToString(b), nil
+
+	return signedToken, nil
 }
 
-func main() {
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Fatal("Error loading .env file")
+type jwtExtractFn func(claims jwt.MapClaims) (bool, string, error)
+
+func (c Config) validateJWT(tokenString string, okCB jwtExtractFn) (bool, string, error) {
+	if tokenString == "" {
+		return false, "", nil // No token provided
 	}
 
-	config := Config{
-		AuthKey:       os.Getenv("AUTH_KEY"),
-		MailgunAPIKey: os.Getenv("MAILGUN_API_KEY"),
-		MailgunDomain: os.Getenv("MAILGUN_DOMAIN"),
-		ServerURL:     os.Getenv("SERVER_URL"),
-		ProxyAddr:     os.Getenv("PROXY_ADDR"),
-		BindAddr:      os.Getenv("BIND_ADDR"),
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		// Verify signing method
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return false, jwt.ErrSignatureInvalid
+		}
+		// Provide the same secret key used for signing
+		return []byte(c.AuthKey), nil
+	})
+	if err != nil {
+		return false, "", err
 	}
 
-	if config.AuthKey == "" || config.MailgunAPIKey == "" || config.MailgunDomain == "" ||
-		config.ServerURL == "" || config.ProxyAddr == "" || config.BindAddr == "" {
-		log.Fatal("Missing required environment variables, any of: AUTH_KEY, MAILGUN_API_KEY, MAILGUN_DOMAIN, SERVER_URL, PROXY_ADDR, BIND_ADDR")
+	// Check if token is valid and not expired
+	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		return okCB(claims)
 	}
 
+	return false, "", nil
+}
+
+func (c Config) generateCSRFToken(r *http.Request) (string, error) {
+	ip := c.requestCSRFIp(r)
+	return c.generateJWT(jwt.MapClaims{
+		"ip": ip,
+	}, time.Hour*24*7) // expire after a week
+}
+
+func (c Config) verifyCSRFToken(r *http.Request) (bool, string, error) {
+	// Get CSRF token from form field
+	tokenString := r.FormValue("_csrf")
+	return c.validateJWT(tokenString, func(claims jwt.MapClaims) (bool, string, error) {
+		ip := c.requestCSRFIp(r)
+		// Verify IP matches the claim
+		if claimIP, ok := claims["ip"].(string); ok && claimIP == ip {
+			return true, claims["ip"].(string), nil
+		}
+		return false, "", nil
+	})
+}
+
+func getConfig() Config {
+	config := Config{}
+
+	err := cleanenv.ReadConfig("config.yml", &config)
+	if err != nil {
+		log.Fatalf("Failed loading configuration: %v", err)
+	}
+
+	return config
+}
+
+func (c Config) revProxy() *httputil.ReverseProxy {
 	// Parse proxy URL
-	proxyURL, err := url.Parse(config.ProxyAddr)
+	proxyURL, err := url.Parse(c.ProxyAddr)
 	if err != nil {
 		log.Fatalf("Invalid proxy URL: %v", err)
 	}
 
 	// Initialize reverse proxy
-	proxy := httputil.NewSingleHostReverseProxy(proxyURL)
+	return httputil.NewSingleHostReverseProxy(proxyURL)
+}
 
-	// Initialize templates
-	tmpl := template.Must(template.ParseFS(templates, "templates/*.html"))
+func (c Config) extractClaimIP(r *http.Request) jwtExtractFn {
+	return func(claims jwt.MapClaims) (bool, string, error) {
+		ip := c.requestCSRFIp(r)
+		// Verify IP matches the claim
+		if claimIP, ok := claims["ip"].(string); ok && claimIP == ip {
+			return true, claims["ip"].(string), nil
+		}
+		return false, "", nil
+	}
+}
 
-	http.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
-		// Handle magic link callback
-		tokenStr := r.URL.Query().Get("token")
-		token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+func (c Config) extractClaimEmail(r *http.Request) jwtExtractFn {
+	return func(claims jwt.MapClaims) (bool, string, error) {
+		if email, ok := claims["email"].(string); ok && email != "" {
+			return true, claims["email"].(string), nil
+		}
+		return false, "", nil
+	}
+}
+
+func (c Config) shortcutAuthed(next http.Handler) http.Handler {
+	proxy := c.revProxy()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenString, err := r.Cookie("Auth")
+		if err == nil {
+			if ok, email, err := c.validateJWT(tokenString.Value, c.extractClaimEmail(r)); ok &&
+				err == nil && email != "" {
+				dbg("valid jwt, proxytime")
+				// Valid JWT: add X-Auth-Email header and proxy
+				r.Header.Set("X-Auth-Email", email)
+				proxy.ServeHTTP(w, r)
+				return
 			}
-			return []byte(config.AuthKey), nil
-		})
-
-		if err != nil || !token.Valid {
-			http.Error(w, "Invalid token", http.StatusUnauthorized)
-			return
 		}
+		// continue chain if auth shortcut didn't work
+		dbg("authed? no. descending.")
+		next.ServeHTTP(w, r)
+		return
+	})
 
-		claims, ok := token.Claims.(*Claims)
-		if !ok {
-			http.Error(w, "Invalid claims", http.StatusUnauthorized)
-			return
-		}
+}
 
-		// Set Auth cookie
+func (c Config) generateAuthToken(email string) (string, error) {
+	token, err := c.generateJWT(jwt.MapClaims{
+		"email": email,
+	}, time.Hour*24*7) // expire after a week
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (c Config) setAuthCookie(w http.ResponseWriter, email string) error {
+	if token, err := c.generateAuthToken(email); err == nil {
 		http.SetCookie(w, &http.Cookie{
 			Name:     "Auth",
-			Value:    tokenStr,
+			Value:    token,
 			Path:     "/",
-			Expires:  time.Now().Add(24 * time.Hour),
+			Expires:  time.Now().Add(time.Hour * 24 * 7),
 			HttpOnly: true,
 			Secure:   true,
 			SameSite: http.SameSiteStrictMode,
 		})
+	}
+	return nil
+}
 
-		// Redirect to original path or root
-		redirectPath := "/"
-		if path := r.URL.Query().Get("redirect"); path != "" && strings.HasPrefix(path, "/") {
-			redirectPath = path
-		}
-		http.Redirect(w, r, redirectPath, http.StatusFound)
-	})
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Check for valid JWT in Auth cookie
-		cookie, err := r.Cookie("Auth")
-		var email string
-		if err == nil {
-			token, err := jwt.ParseWithClaims(cookie.Value, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-					return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-				}
-				return []byte(config.AuthKey), nil
-			})
-			if err == nil && token.Valid {
-				if claims, ok := token.Claims.(*Claims); ok {
-					email = claims.Email
-				}
-			}
-		}
-
-		if email != "" {
+func (c Config) shortcutAuthing(next http.Handler) http.Handler {
+	proxy := c.revProxy()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenString := r.URL.Query().Get("token") // token provided, try parsing it
+		if ok, email, err := c.validateJWT(tokenString, c.extractClaimEmail(r)); ok && err == nil && email != "" {
+			dbg("valid jwt, authing")
+			// Record this for later
+			c.setAuthCookie(w, email)
 			// Valid JWT: add X-Auth-Email header and proxy
 			r.Header.Set("X-Auth-Email", email)
 			proxy.ServeHTTP(w, r)
 			return
+		} else { // continue chain if auth shortcut didn't work
+			dbg("authing? no. descending.")
+			next.ServeHTTP(w, r)
+			return
+		}
+		dbg("authing? no. wtfing")
+		return
+	})
+}
+
+func (c Config) sendRegistration(w http.ResponseWriter, r *http.Request, tmpl *template.Template) error {
+	email := r.FormValue("email")
+	dbg("sending email to " + email)
+	if token, err := c.generateAuthToken(email); err == nil {
+		if err != nil {
+			return err
+		}
+		data := EmailPayload{
+			HttpPathAtSend: r.RequestURI,
+			Name:           r.FormValue("name"),
+			Email:          r.FormValue("email"),
+			Token:          token,
+		}
+		where := c.Smtp.Addr
+		auth := smtp.PlainAuth("", c.Smtp.User, c.Smtp.Pass, c.Smtp.Addr)
+		from := c.Smtp.From
+		to := append(c.Smtp.Bcc, r.FormValue("email"))
+		msg := bytes.NewBuffer([]byte{})
+		if c.Smtp.MessageTplName != "" {
+			err := tmpl.ExecuteTemplate(msg, c.Smtp.MessageTplName, data)
+			if err != nil {
+				return err
+			}
+		} else {
+			finalTpl, err := tmpl.Parse(c.Smtp.MessageTpl)
+			if err != nil {
+				return err
+			}
+			err = finalTpl.Execute(msg, data)
+			if err != nil {
+				return err
+			}
+		}
+		msgBytes := bytes.Replace(msg.Bytes(), []byte("\n"), []byte("\r\n"), -1)
+		dbg("ready to send email")
+		dbg(string(msgBytes))
+		return smtp.SendMail(where, auth, from, to, msgBytes)
+	}
+	return nil
+}
+
+// root is presented a clean path. By the time we get here, a user is not authenticated.
+// If they are POSTing, they are requesting an email be sent to them, maybe.
+// If they are anything else, they are unauthenticated and should be presented with a form.
+func (c Config) posted() http.HandlerFunc {
+	// Initialize templates
+	tmpl := template.Must(template.ParseFS(templates, "templates/*"))
+	return func(w http.ResponseWriter, r *http.Request) {
+		dbg("posted so handling that")
+		passParams := WebTemplateArgs{}
+		ok, ip, err := c.verifyCSRFToken(r)
+		if ok && err == nil && ip != "" {
+			subtpl, err := tmpl.Clone()
+			if err != nil {
+				http.Error(w, "Template Clone error", http.StatusInternalServerError)
+			}
+			if err := c.sendRegistration(w, r, subtpl); err == nil {
+				dbg("Tried to email!")
+				passParams.TriedEmail = true
+			} else {
+				dbg(err.Error())
+				passParams.Error = err.Error()
+			}
 		}
 
-		// No valid JWT: serve splash page
-		if r.Method == http.MethodPost {
-			return handleRegistration(w, r, config, tmpl)
+		tok, err := c.generateCSRFToken(r)
+		if err != nil {
+			http.Error(w, "CSRF error", http.StatusInternalServerError)
+		} else {
+			passParams.CsrfToken = tok
 		}
-		data := RegistrationData{}
-		if err := tmpl.ExecuteTemplate(w, "splash.html", data); err != nil {
+
+		if err := tmpl.ExecuteTemplate(w, "splash.html", passParams); err != nil {
 			http.Error(w, "Template error", http.StatusInternalServerError)
 		}
-	})
-
-	log.Printf("Starting server on %s", config.BindAddr)
-	if err := http.ListenAndServe(config.BindAddr, nil); err != nil {
-		log.Fatalf("Server failed: %v", err)
 	}
 }
 
-func handleRegistration(w http.ResponseWriter, r *http.Request, config Config, tmpl *template.Template) {
-	data := RegistrationData{
-		Name:   r.FormValue("name"),
-		Email:  r.FormValue("email"),
-		OptOut: r.FormValue("optin") != "on",
+func (c Config) root() http.HandlerFunc {
+	// Initialize templates
+	tmpl := template.Must(template.ParseFS(templates, "templates/*"))
+	return func(w http.ResponseWriter, r *http.Request) {
+		dbg("splash and login")
+		templateArgs := WebTemplateArgs{}
+		tok, err := c.generateCSRFToken(r)
+		if err != nil {
+			http.Error(w, "CSRF error", http.StatusInternalServerError)
+		} else {
+			templateArgs.CsrfToken = tok
+		}
+		// nice splash and login page
+		if err := tmpl.ExecuteTemplate(w, "splash.html", templateArgs); err != nil {
+			http.Error(w, "Template error", http.StatusInternalServerError)
+		}
+	}
+}
+
+func main() {
+	// Load environment variables
+	if err := godotenv.Load(); err != nil {
+		log.Fatalf("Error loading .env file: %v", err)
 	}
 
-	if data.Name == "" || data.Email == "" {
-		data.Error = "Name and email are required"
-		tmpl.ExecuteTemplate(w, "splash.html", data)
-		return
-	}
+	config := getConfig()
 
-	// Create JWT
-	claims := &Claims{
-		Email: data.Email,
-		StandardClaims: jwt.StandardClaims{
-			ExpiresAt: time.Now().Add(time.Hour).Unix(),
-			Issuer:    config.ServerURL,
-		},
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString([]byte(config.AuthKey))
-	if err != nil {
-		data.Error = "Failed to create token"
-		tmpl.ExecuteTemplate(w, "splash.html", data)
-		return
-	}
-
-	// Send email with magic link
-	mg := mailgun.NewMailgun(config.MailgunDomain, config.MailgunAPIKey)
-	subject := "Login to our service"
-	magicLink := fmt.Sprintf("%s/auth?token=%s", config.ServerURL, url.QueryEscape(tokenString))
-	body := fmt.Sprintf("Hi %s,\n\nClick here to log in: %s\n\nThis link expires in 1 hour.", data.Name, magicLink)
-	message := mg.NewMessage("no-reply@yourdomain.com", data.Name, subject, data.Email)
-	message.SetText(body)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	defer cancel()
-
-	_, _, err = mg.Send(ctx, message)
-	if err != nil {
-		data.Error = "Failed to send email"
-		tmpl.ExecuteTemplate(w, "splash.html", data)
-		return
-	}
-
-	// Optionally store opt-in status (e.g., in a database)
-	if data.OptIn {
-		log.Printf("User %s opted in to marketing", data.Email)
-	}
-
-	data.Success = true
-	tmpl.ExecuteTemplate(w, "splash.html", data)
+	r := aerouter.NewRouter()
+	r.Use(config.shortcutAuthed)
+	r.Use(config.shortcutAuthing)
+	r.HandleFunc("POST /", config.posted())
+	r.HandleFunc("/", config.root())
+	log.Printf("[emailproxy] Listening on %s\n", config.BindAddr)
+	dbg("Debug on")
+	log.Fatal(http.ListenAndServe(config.BindAddr, r))
 }
