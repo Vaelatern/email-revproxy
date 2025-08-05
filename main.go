@@ -15,7 +15,6 @@ import (
 	"github.com/Vaelatern/email-revproxy/internal/aerouter"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/ilyakaznacheev/cleanenv"
-	"github.com/joho/godotenv"
 )
 
 func dbg(a string) {
@@ -349,11 +348,6 @@ func (c Config) root() http.HandlerFunc {
 }
 
 func main() {
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Fatalf("Error loading .env file: %v", err)
-	}
-
 	config := getConfig()
 
 	r := aerouter.NewRouter()
