@@ -374,11 +374,11 @@ func main() {
 		config.Debug = true
 		// Initialize templates - copied from elsewhere
 		tmpl := template.Must(template.ParseFS(templates, "templates/*"))
-		config.sendEmail(tmpl, EmailPayload{
+		log.Printf("%v\n", config.sendEmail(tmpl, EmailPayload{
 			HttpPathAtSend: "ThisWillBeTheURL",
 			Name:           "ThisIsYourName",
 			Email:          config.TestSend,
-		})
+		}))
 		return
 	}
 	log.Printf("[emailproxy] Listening on %s\n", config.BindAddr)
