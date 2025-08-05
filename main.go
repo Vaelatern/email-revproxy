@@ -59,6 +59,7 @@ type Config struct {
 	Smtp      EmailConf    `env-prefix:"SMTP" yaml:"smtp" json:"smtp"`
 	Detect    ClientDetect `env-prefix:"CLIENT_DETECT" yaml:"client-detect" json:"client-detect"`
 	Debug     bool         `env-prefix:"DEBUG" yaml:"debug" json:"debug"`
+	TestSend  string       `env-prefix:"TEST_SEND_TO" yaml:"test-send-to" json:"test-send-to"`
 }
 
 func (c Config) dbg(a string) {
@@ -258,23 +259,17 @@ func (c Config) shortcutAuthing(next http.Handler) http.Handler {
 	})
 }
 
-func (c Config) sendRegistration(w http.ResponseWriter, r *http.Request, tmpl *template.Template) error {
-	email := r.FormValue("email")
-	c.dbg("sending email to " + email)
-	if token, err := c.generateAuthToken(email); err == nil {
+func (c Config) sendEmail(tmpl *template.Template, data EmailPayload) error {
+	c.dbg("sending email to " + data.Email)
+	if token, err := c.generateAuthToken(data.Email); err == nil {
 		if err != nil {
 			return err
 		}
-		data := EmailPayload{
-			HttpPathAtSend: r.RequestURI,
-			Name:           r.FormValue("name"),
-			Email:          r.FormValue("email"),
-			Token:          token,
-		}
+		data.Token = token
 		where := c.Smtp.Addr
 		auth := smtp.PlainAuth("", c.Smtp.User, c.Smtp.Pass, c.Smtp.Addr)
 		from := c.Smtp.From
-		to := append(c.Smtp.Bcc, r.FormValue("email"))
+		to := append(c.Smtp.Bcc, data.Email)
 		msg := bytes.NewBuffer([]byte{})
 		if c.Smtp.MessageTplName != "" {
 			err := tmpl.ExecuteTemplate(msg, c.Smtp.MessageTplName, data)
@@ -295,8 +290,18 @@ func (c Config) sendRegistration(w http.ResponseWriter, r *http.Request, tmpl *t
 		c.dbg("ready to send email")
 		c.dbg(string(msgBytes))
 		return smtp.SendMail(where, auth, from, to, msgBytes)
+	} else {
+		return err
 	}
-	return nil
+}
+
+func (c Config) sendRegistration(w http.ResponseWriter, r *http.Request, tmpl *template.Template) error {
+	data := EmailPayload{
+		HttpPathAtSend: r.RequestURI,
+		Name:           r.FormValue("name"),
+		Email:          r.FormValue("email"),
+	}
+	return c.sendEmail(tmpl, data)
 }
 
 // root is presented a clean path. By the time we get here, a user is not authenticated.
@@ -363,7 +368,19 @@ func main() {
 	r.Use(config.shortcutAuthing)
 	r.HandleFunc("POST /", config.posted())
 	r.HandleFunc("/", config.root())
-	log.Printf("[emailproxy] Listening on %s\n", config.BindAddr)
 	config.dbg("Debug on")
+	if config.TestSend != "" {
+		log.Printf("[emailproxy] One-shot testing an email send to %s\n", config.TestSend)
+		config.Debug = true
+		// Initialize templates - copied from elsewhere
+		tmpl := template.Must(template.ParseFS(templates, "templates/*"))
+		config.sendEmail(tmpl, EmailPayload{
+			HttpPathAtSend: "ThisWillBeTheURL",
+			Name:           "ThisIsYourName",
+			Email:          config.TestSend,
+		})
+		return
+	}
+	log.Printf("[emailproxy] Listening on %s\n", config.BindAddr)
 	log.Fatal(http.ListenAndServe(config.BindAddr, r))
 }
