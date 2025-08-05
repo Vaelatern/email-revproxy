@@ -17,10 +17,6 @@ import (
 	"github.com/ilyakaznacheev/cleanenv"
 )
 
-func dbg(a string) {
-	log.Println(a)
-}
-
 //go:embed templates/*
 var templates embed.FS
 
@@ -62,6 +58,14 @@ type Config struct {
 	BindAddr  string       `env:"BIND_ADDR" yaml:"bind-address" json:"bind-address" env-default:":8080"`
 	Smtp      EmailConf    `env-prefix:"SMTP" yaml:"smtp" json:"smtp"`
 	Detect    ClientDetect `env-prefix:"CLIENT_DETECT" yaml:"client-detect" json:"client-detect"`
+	Debug     bool         `env-prefix:"DEBUG" yaml:"debug" json:"debug"`
+}
+
+func (c Config) dbg(a string) {
+	if !c.Debug {
+		return
+	}
+	log.Println(a)
 }
 
 func (c Config) requestCSRFIp(r *http.Request) string {
@@ -92,6 +96,7 @@ func (c Config) generateJWT(claims jwt.MapClaims, expireIn time.Duration) (strin
 	return signedToken, nil
 }
 
+// Tiny useful function type for arbitrary JWT checks
 type jwtExtractFn func(claims jwt.MapClaims) (bool, string, error)
 
 func (c Config) validateJWT(tokenString string, okCB jwtExtractFn) (bool, string, error) {
@@ -118,6 +123,9 @@ func (c Config) validateJWT(tokenString string, okCB jwtExtractFn) (bool, string
 
 	return false, "", nil
 }
+
+// For CSRF tokens we just sign a JWT with the IP address of the requester
+// This should prevent exploit channels
 
 func (c Config) generateCSRFToken(r *http.Request) (string, error) {
 	ip := c.requestCSRFIp(r)
@@ -188,7 +196,7 @@ func (c Config) shortcutAuthed(next http.Handler) http.Handler {
 		if err == nil {
 			if ok, email, err := c.validateJWT(tokenString.Value, c.extractClaimEmail(r)); ok &&
 				err == nil && email != "" {
-				dbg("valid jwt, proxytime")
+				c.dbg("valid jwt, proxytime")
 				// Valid JWT: add X-Auth-Email header and proxy
 				r.Header.Set("X-Auth-Email", email)
 				proxy.ServeHTTP(w, r)
@@ -196,7 +204,7 @@ func (c Config) shortcutAuthed(next http.Handler) http.Handler {
 			}
 		}
 		// continue chain if auth shortcut didn't work
-		dbg("authed? no. descending.")
+		c.dbg("authed? no. descending.")
 		next.ServeHTTP(w, r)
 		return
 	})
@@ -233,7 +241,7 @@ func (c Config) shortcutAuthing(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tokenString := r.URL.Query().Get("token") // token provided, try parsing it
 		if ok, email, err := c.validateJWT(tokenString, c.extractClaimEmail(r)); ok && err == nil && email != "" {
-			dbg("valid jwt, authing")
+			c.dbg("valid jwt, authing")
 			// Record this for later
 			c.setAuthCookie(w, email)
 			// Valid JWT: add X-Auth-Email header and proxy
@@ -241,18 +249,18 @@ func (c Config) shortcutAuthing(next http.Handler) http.Handler {
 			proxy.ServeHTTP(w, r)
 			return
 		} else { // continue chain if auth shortcut didn't work
-			dbg("authing? no. descending.")
+			c.dbg("authing? no. descending.")
 			next.ServeHTTP(w, r)
 			return
 		}
-		dbg("authing? no. wtfing")
+		c.dbg("authing? no. wtfing")
 		return
 	})
 }
 
 func (c Config) sendRegistration(w http.ResponseWriter, r *http.Request, tmpl *template.Template) error {
 	email := r.FormValue("email")
-	dbg("sending email to " + email)
+	c.dbg("sending email to " + email)
 	if token, err := c.generateAuthToken(email); err == nil {
 		if err != nil {
 			return err
@@ -284,8 +292,8 @@ func (c Config) sendRegistration(w http.ResponseWriter, r *http.Request, tmpl *t
 			}
 		}
 		msgBytes := bytes.Replace(msg.Bytes(), []byte("\n"), []byte("\r\n"), -1)
-		dbg("ready to send email")
-		dbg(string(msgBytes))
+		c.dbg("ready to send email")
+		c.dbg(string(msgBytes))
 		return smtp.SendMail(where, auth, from, to, msgBytes)
 	}
 	return nil
@@ -298,7 +306,7 @@ func (c Config) posted() http.HandlerFunc {
 	// Initialize templates
 	tmpl := template.Must(template.ParseFS(templates, "templates/*"))
 	return func(w http.ResponseWriter, r *http.Request) {
-		dbg("posted so handling that")
+		c.dbg("posted so handling that")
 		passParams := WebTemplateArgs{}
 		ok, ip, err := c.verifyCSRFToken(r)
 		if ok && err == nil && ip != "" {
@@ -307,10 +315,10 @@ func (c Config) posted() http.HandlerFunc {
 				http.Error(w, "Template Clone error", http.StatusInternalServerError)
 			}
 			if err := c.sendRegistration(w, r, subtpl); err == nil {
-				dbg("Tried to email!")
+				c.dbg("Tried to email!")
 				passParams.TriedEmail = true
 			} else {
-				dbg(err.Error())
+				c.dbg(err.Error())
 				passParams.Error = err.Error()
 			}
 		}
@@ -332,7 +340,7 @@ func (c Config) root() http.HandlerFunc {
 	// Initialize templates
 	tmpl := template.Must(template.ParseFS(templates, "templates/*"))
 	return func(w http.ResponseWriter, r *http.Request) {
-		dbg("splash and login")
+		c.dbg("splash and login")
 		templateArgs := WebTemplateArgs{}
 		tok, err := c.generateCSRFToken(r)
 		if err != nil {
@@ -356,6 +364,6 @@ func main() {
 	r.HandleFunc("POST /", config.posted())
 	r.HandleFunc("/", config.root())
 	log.Printf("[emailproxy] Listening on %s\n", config.BindAddr)
-	dbg("Debug on")
+	config.dbg("Debug on")
 	log.Fatal(http.ListenAndServe(config.BindAddr, r))
 }
